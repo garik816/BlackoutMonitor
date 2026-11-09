@@ -1,0 +1,78 @@
+name: OpenWrt APK
+on:
+  push:
+    branches: [main]
+    paths: ['files/**', 'package/**', '.github/workflows/openwrt-apk.yml', 'keys/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential gawk gettext libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget curl zstd flex bison
+      - name: Download official OpenWrt SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
+          curl -fL --retry 3 -o /tmp/sha256sums "$base/sha256sums"
+          sdk_name=$(awk '{print $2}' /tmp/sha256sums | grep '^openwrt-sdk-25.12.6-x86-64_.*Linux-x86_64.tar.zst$' | head -1)
+          test -n "$sdk_name"
+          curl -fL --retry 3 -o "/tmp/$sdk_name" "$base/$sdk_name"
+          (cd /tmp && grep -F " $sdk_name" sha256sums | sha256sum -c -)
+          mkdir -p /tmp/owrt
+          tar --zstd -xf "/tmp/$sdk_name" -C /tmp/owrt
+          mv /tmp/owrt/openwrt-sdk-* sdk
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/package/luci-app-blackout-monitor
+          cp package/luci-app-blackout-monitor/Makefile sdk/package/luci-app-blackout-monitor/Makefile
+          cp -a files sdk/package/luci-app-blackout-monitor/files
+          sed -i "s/^PKG_RELEASE:=1$/PKG_RELEASE:=$GITHUB_RUN_NUMBER/" sdk/package/luci-app-blackout-monitor/Makefile
+          cd sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -p packages
+          ./scripts/feeds install -a -p luci
+          printf '\nCONFIG_PACKAGE_luci-app-blackout-monitor=y\n' >> .config
+          rm -rf tmp
+          make defconfig
+          make -j"$(nproc)" package/luci-app-blackout-monitor/compile V=s
+          test "$(find bin/packages -name 'luci-app-blackout-monitor-*.apk' | wc -l)" -eq 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-blackout-monitor-apk
+          path: sdk/bin/packages/**/luci-app-blackout-monitor-*.apk
+          if-no-files-found: error
+      - name: Sign APK feed
+        id: sign
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$APK_SIGN_KEY" ]; then echo '::notice::Set secret APK_SIGN_KEY to publish the feed'; exit 0; fi
+          umask 077
+          printf '%s\n' "$APK_SIGN_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl ec -in "$RUNNER_TEMP/key.pem" -pubout -out "$RUNNER_TEMP/public.pem" 2>/dev/null
+          cmp keys/blackout-monitor.pem "$RUNNER_TEMP/public.pem"
+          mkdir -p public/keys public/releases/25.12/x86_64
+          cp keys/blackout-monitor.pem public/keys/
+          find sdk/bin/packages -name 'luci-app-blackout-monitor-*.apk' -exec cp '{}' public/releases/25.12/x86_64/ \;
+          (cd public/releases/25.12/x86_64 && "$GITHUB_WORKSPACE/sdk/staging_dir/host/bin/apk" mkndx --allow-untrusted --sign-key "$RUNNER_TEMP/key.pem" --output packages.adb *.apk)
+          printf '<!doctype html><title>BlackoutMonitor APK</title><h1>BlackoutMonitor signed APK feed</h1>' > public/index.html
+          touch public/.nojekyll
+          rm -f "$RUNNER_TEMP/key.pem" "$RUNNER_TEMP/public.pem"
+          echo 'ok=true' >> "$GITHUB_OUTPUT"
+      - uses: peaceiris/actions-gh-pages@v4
+        if: steps.sign.outputs.ok == 'true'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
+          force_orphan: true
+          enable_jekyll: false
