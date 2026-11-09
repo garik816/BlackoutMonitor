@@ -1,0 +1,12 @@
+{
+	"luci-app-svitlo": {
+		"description": "Read the Novi Petrivtsi electricity schedule",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/libexec/svitlo-schedule": [ "exec" ],
+				"/usr/libexec/svitlo-schedule refresh": [ "exec" ]
+			}
+		}
+	}
+}

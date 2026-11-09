@@ -1,0 +1,8 @@
+{
+	"admin/services/svitlo": {
+		"title": "Графики отключений",
+		"order": 11,
+		"action": { "type": "template", "path": "my-scripts/svitlo" },
+		"depends": { "acl": [ "luci-app-svitlo" ] }
+	}
+}

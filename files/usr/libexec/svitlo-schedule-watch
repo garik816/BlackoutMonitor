@@ -1,0 +1,5 @@
+#!/usr/bin/python3
+"""Background collector; deliberately absent from the LuCI execution ACL."""
+from svitlo_schedule import watch
+
+watch()

@@ -1,0 +1,86 @@
+#!/usr/bin/python3
+"""Read-only, parameter-limited entrypoint for the LuCI dashboard."""
+
+from datetime import datetime
+import json
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from urllib.parse import quote
+
+from smartmeter_config import public_target, read_targets
+
+
+def latest_status(target):
+    path = Path(target["database"])
+    if not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2) as connection:
+            row = connection.execute(
+                "SELECT s.ts,s.status,s.reason,r.ended_at FROM samples s "
+                "JOIN runs r ON r.id=s.run_id ORDER BY s.id DESC LIMIT 1"
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None:
+        return None
+    timestamp, status, reason, ended_at = row
+    return {"timestamp": timestamp, "status": status, "reason": reason,
+            "monitor_running": target["enabled"] == "1" and ended_at is None and
+            time.time() - timestamp <= max(60, int(target["interval"]) * 3)}
+
+
+def empty_data(target, day):
+    empty = {"up": 0, "down": 0, "error": 0, "availability": None}
+    return {"host": target["url"] if target["type"] == "http" else target["host"],
+            "today": datetime.now().date().isoformat(), "selected_day": day,
+            "interval_seconds": int(target["interval"]), "current": None,
+            "summary": {period: dict(empty) for period in ("today", "week", "month", "all")},
+            "days": [], "minutes": [], "outages": [], "uptimes": []}
+
+
+def detail(target, day):
+    if not Path(target["database"]).is_file():
+        return empty_data(target, day)
+    result = subprocess.run(
+        ["/usr/bin/smartmeter-availability", "json", "--host",
+         target["url"] if target["type"] == "http" else target["host"],
+         "--db", target["database"], "--interval", target["interval"],
+         "--days", "365", "--day", day],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Не удалось прочитать статистику")
+    return json.loads(result.stdout)
+
+
+def main():
+    try:
+        if len(sys.argv) > 3:
+            raise ValueError("Ожидаются идентификатор и дата")
+        targets = read_targets()
+        if not targets:
+            raise ValueError("Не настроено ни одной проверки")
+        ident = sys.argv[1] if len(sys.argv) >= 2 else targets[0]["id"]
+        day = sys.argv[2] if len(sys.argv) == 3 else datetime.now().date().isoformat()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or datetime.strptime(day, "%Y-%m-%d").date().isoformat() != day:
+            raise ValueError("Некорректная дата")
+        target = next((item for item in targets if item["id"] == ident), None)
+        if target is None:
+            raise ValueError("Проверка не найдена")
+        result = detail(target, day)
+        result["target"] = public_target(target)
+        result["selected_target"] = ident
+        result["targets"] = [{**public_target(item), "current": latest_status(item)} for item in targets]
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, sqlite3.Error) as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

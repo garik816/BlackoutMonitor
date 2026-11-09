@@ -1,0 +1,13 @@
+{
+	"admin/services/smartmeter": {
+		"title": "Мониторинг доступности",
+		"order": 10,
+		"action": {
+			"type": "template",
+			"path": "my-scripts/smartmeter"
+		},
+		"depends": {
+			"acl": [ "luci-app-my-scripts" ]
+		}
+	}
+}

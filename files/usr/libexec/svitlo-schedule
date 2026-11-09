@@ -1,0 +1,5 @@
+#!/usr/bin/python3
+"""Parameter-limited LuCI entrypoint."""
+from svitlo_schedule import main
+
+main()

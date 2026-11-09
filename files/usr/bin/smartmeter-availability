@@ -1,0 +1,570 @@
+#!/usr/bin/python3
+"""Record availability of one network or web resource."""
+
+import argparse
+from datetime import datetime, timedelta
+import json
+import os
+from pathlib import Path
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+
+
+DEFAULT_DB = "/root/smartmeter-availability.sqlite3"
+stopping = False
+
+
+def stop_handler(_signum, _frame):
+    global stopping
+    stopping = True
+
+
+def format_time(timestamp):
+    return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} д")
+    if hours or days:
+        parts.append(f"{hours} ч")
+    if minutes or hours or days:
+        parts.append(f"{minutes} мин")
+    parts.append(f"{seconds} сек")
+    return " ".join(parts)
+
+
+def probe_arp(host, interface, expected_mac, timeout):
+    command = [
+        "nmap", "-sn", "-PR", "-n", "-e", interface,
+        "--max-retries", "1", "--host-timeout", f"{timeout}s", "-oX", "-", host,
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 3, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "error", "", f"ошибка запуска проверки: {type(exc).__name__}"
+    if result.returncode != 0:
+        return "error", "", f"nmap завершился с кодом {result.returncode}"
+    try:
+        root = ET.fromstring(result.stdout)
+    except ET.ParseError:
+        return "error", "", "некорректный ответ nmap"
+    target = root.find("host")
+    if target is None:
+        return "down", "", "нет ответа ARP"
+    status = target.find("status")
+    if status is None or status.get("state") != "up":
+        return "down", "", "нет ответа ARP"
+    mac = next(
+        (address.get("addr", "") for address in target.findall("address")
+         if address.get("addrtype") == "mac"),
+        "",
+    ).lower()
+    if expected_mac and mac != expected_mac.lower():
+        return "down", mac, f"ответил другой MAC: {mac or 'неизвестен'}"
+    return "up", mac, "ответ ARP"
+
+
+def probe_icmp(host, timeout):
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout), host],
+            capture_output=True, text=True, timeout=timeout + 3, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "error", "", f"ошибка запуска ping: {type(exc).__name__}"
+    if result.returncode == 0:
+        return "up", "", "ответ ICMP"
+    if result.returncode == 1:
+        return "down", "", "нет ответа ICMP"
+    return "error", "", f"ping завершился с кодом {result.returncode}"
+
+
+def probe_http(url, timeout, expected_status):
+    try:
+        result = subprocess.run(
+            ["curl", "--location", "--max-redirs", "5", "--silent", "--show-error",
+             "--output", "/dev/null", "--write-out", "%{http_code}",
+             "--max-time", str(timeout), "--connect-timeout", str(timeout),
+             "--user-agent", "OpenWrt-Availability/1.0", "--url", url],
+            capture_output=True, text=True, timeout=timeout + 3, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "error", "", f"ошибка запуска curl: {type(exc).__name__}"
+    if result.returncode:
+        return "down", "", (result.stderr.strip() or f"curl: код {result.returncode}")[:240]
+    try:
+        code = int(result.stdout.strip())
+    except ValueError:
+        return "error", "", "curl вернул некорректный HTTP-код"
+    return (
+        ("up", "", f"HTTP {code}") if code == expected_status
+        else ("down", "", f"HTTP {code}, ожидался {expected_status}")
+    )
+
+
+def probe(args):
+    if args.type == "arp":
+        return probe_arp(args.host, args.interface, args.mac, args.timeout)
+    if args.type == "icmp":
+        return probe_icmp(args.host, args.timeout)
+    return probe_http(args.url, args.timeout, args.expected_status)
+
+
+def open_database(path, create=False):
+    database = Path(path)
+    if not create and not database.is_file():
+        raise FileNotFoundError(f"Статистика ещё не создана: {database}")
+    if create:
+        database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("PRAGMA busy_timeout=5000")
+    if create:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                interrupted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS samples (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                mac TEXT,
+                reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts);
+            CREATE TABLE IF NOT EXISTS daily (
+                day TEXT PRIMARY KEY,
+                up_samples INTEGER NOT NULL DEFAULT 0,
+                down_samples INTEGER NOT NULL DEFAULT 0,
+                error_samples INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS minutes (
+                day TEXT NOT NULL,
+                minute_of_day INTEGER NOT NULL,
+                up_samples INTEGER NOT NULL DEFAULT 0,
+                down_samples INTEGER NOT NULL DEFAULT 0,
+                error_samples INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, minute_of_day)
+            );
+            CREATE TABLE IF NOT EXISTS outages (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                last_down_at INTEGER NOT NULL,
+                interrupted INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        if connection.execute("SELECT COUNT(*) FROM minutes").fetchone()[0] == 0:
+            with connection:
+                for timestamp, status in connection.execute("SELECT ts,status FROM samples"):
+                    add_minute(connection, timestamp, status)
+        os.chmod(database, 0o600)
+    return connection
+
+
+def add_minute(connection, timestamp, status):
+    local = datetime.fromtimestamp(timestamp)
+    day = local.date().isoformat()
+    minute = local.hour * 60 + local.minute
+    up, down, error = (int(status == kind) for kind in ("up", "down", "error"))
+    connection.execute(
+        "INSERT INTO minutes(day,minute_of_day,up_samples,down_samples,error_samples) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(day,minute_of_day) DO UPDATE SET "
+        "up_samples=up_samples+excluded.up_samples, "
+        "down_samples=down_samples+excluded.down_samples, "
+        "error_samples=error_samples+excluded.error_samples",
+        (day, minute, up, down, error),
+    )
+
+
+def start_run(connection):
+    now = int(time.time())
+    with connection:
+        previous = connection.execute(
+            "SELECT id FROM runs WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if previous:
+            run_id = previous[0]
+            last = connection.execute(
+                "SELECT MAX(ts) FROM samples WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE runs SET ended_at=?, interrupted=1 WHERE id=?",
+                (last or now, run_id),
+            )
+            connection.execute(
+                "UPDATE outages SET ended_at=last_down_at, interrupted=1 "
+                "WHERE run_id=? AND ended_at IS NULL", (run_id,),
+            )
+        cursor = connection.execute("INSERT INTO runs(started_at) VALUES(?)", (now,))
+    return cursor.lastrowid
+
+
+def finish_run(connection, run_id):
+    with connection:
+        last = connection.execute(
+            "SELECT MAX(ts) FROM samples WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+        connection.execute("UPDATE runs SET ended_at=? WHERE id=?", (last or int(time.time()), run_id))
+        connection.execute(
+            "UPDATE outages SET ended_at=last_down_at, interrupted=1 "
+            "WHERE run_id=? AND ended_at IS NULL", (run_id,),
+        )
+
+
+def record_sample(connection, run_id, timestamp, status, mac, reason):
+    day = datetime.fromtimestamp(timestamp).date().isoformat()
+    previous = connection.execute(
+        "SELECT status FROM samples WHERE run_id=? AND status != 'error' "
+        "ORDER BY id DESC LIMIT 1", (run_id,),
+    ).fetchone()
+    previous_status = previous[0] if previous else None
+    with connection:
+        connection.execute(
+            "INSERT INTO samples(run_id,ts,status,mac,reason) VALUES(?,?,?,?,?)",
+            (run_id, timestamp, status, mac, reason),
+        )
+        up, down, error = (int(status == kind) for kind in ("up", "down", "error"))
+        connection.execute(
+            "INSERT INTO daily(day,up_samples,down_samples,error_samples) VALUES(?,?,?,?) "
+            "ON CONFLICT(day) DO UPDATE SET "
+            "up_samples=up_samples+excluded.up_samples, "
+            "down_samples=down_samples+excluded.down_samples, "
+            "error_samples=error_samples+excluded.error_samples",
+            (day, up, down, error),
+        )
+        add_minute(connection, timestamp, status)
+        if status == "down":
+            if previous_status != "down":
+                connection.execute(
+                    "INSERT INTO outages(run_id,started_at,last_down_at) VALUES(?,?,?)",
+                    (run_id, timestamp, timestamp),
+                )
+            else:
+                connection.execute(
+                    "UPDATE outages SET last_down_at=? WHERE run_id=? AND ended_at IS NULL",
+                    (timestamp, run_id),
+                )
+        elif status == "up" and previous_status == "down":
+            connection.execute(
+                "UPDATE outages SET ended_at=? WHERE run_id=? AND ended_at IS NULL",
+                (timestamp, run_id),
+            )
+    return status != "error" and status != previous_status
+
+
+def prune_samples(connection, days):
+    cutoff = int(time.time()) - days * 86400
+    cutoff_day = datetime.fromtimestamp(cutoff).date().isoformat()
+    with connection:
+        connection.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+        connection.execute("DELETE FROM minutes WHERE day < ?", (cutoff_day,))
+
+
+def restore_missing_database(connection, path):
+    """Reconnect through a complete SQLite backup if the live DB was unlinked."""
+    if Path(path).is_file():
+        return connection
+    temporary = f"{path}.recover-{os.getpid()}.tmp"
+    destination = None
+    try:
+        destination = sqlite3.connect(temporary, timeout=5)
+        connection.backup(destination)
+        if destination.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("recovered database failed quick_check")
+        destination.close()
+        destination = None
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        replacement = open_database(path, create=True)
+    finally:
+        if destination is not None:
+            destination.close()
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    connection.close()
+    print(f"База {path} исчезла; восстановлена из работающего процесса", flush=True)
+    return replacement
+
+
+def print_status(connection, host):
+    latest = connection.execute(
+        "SELECT s.ts,s.status,s.mac,s.reason,r.ended_at "
+        "FROM samples s JOIN runs r ON r.id=s.run_id ORDER BY s.id DESC LIMIT 1"
+    ).fetchone()
+    print(f"Устройство: {host}")
+    if latest:
+        timestamp, status, mac, reason, ended_at = latest
+        translated = {"up": "доступно", "down": "недоступно", "error": "ошибка проверки"}[status]
+        print(f"Состояние: {translated}{' (монитор остановлен)' if ended_at else ''}")
+        print(f"Последняя проверка: {format_time(timestamp)}; {reason}")
+        if mac:
+            print(f"MAC: {mac}")
+    else:
+        print("Проверок пока нет")
+    today = datetime.now().date()
+    for label, first_day in (
+        ("Сегодня", today.isoformat()),
+        ("7 дней", (today - timedelta(days=6)).isoformat()),
+        ("За всё время", "0000-01-01"),
+    ):
+        up, down, error = connection.execute(
+            "SELECT COALESCE(SUM(up_samples),0),COALESCE(SUM(down_samples),0),"
+            "COALESCE(SUM(error_samples),0) FROM daily WHERE day>=?", (first_day,)
+        ).fetchone()
+        measured = up + down
+        share = f"{100 * up / measured:.2f}%" if measured else "нет данных"
+        print(f"{label}: доступность {share}; успешных {up}, неудачных {down}, ошибок проверки {error}")
+    outage = connection.execute(
+        "SELECT started_at,ended_at,interrupted FROM outages ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if outage:
+        started, ended, interrupted = outage
+        duration = format_duration((ended or int(time.time())) - started)
+        note = " (наблюдение прервалось)" if interrupted else ""
+        print(f"Последний сбой: {format_time(started)}; длительность {duration}{note}")
+
+
+def print_history(connection, limit):
+    rows = connection.execute(
+        "SELECT started_at,ended_at,interrupted FROM outages ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    if not rows:
+        print("Сбоев пока нет")
+    for started, ended, interrupted in rows:
+        end_text = format_time(ended) if ended else "продолжается"
+        duration = format_duration((ended or int(time.time())) - started)
+        note = " (наблюдение прервалось)" if interrupted else ""
+        print(f"{format_time(started)} → {end_text}: {duration}{note}")
+
+
+def summary_counts(connection, first_day):
+    up, down, error = connection.execute(
+        "SELECT COALESCE(SUM(up_samples),0),COALESCE(SUM(down_samples),0),"
+        "COALESCE(SUM(error_samples),0) FROM daily WHERE day>=?", (first_day,)
+    ).fetchone()
+    measured = up + down
+    return {
+        "up": up,
+        "down": down,
+        "error": error,
+        "availability": round(100 * up / measured, 2) if measured else None,
+    }
+
+
+def availability_periods(connection, day_start, day_end, interval, now):
+    """Reconstruct observed uptime without joining separate monitor runs or gaps."""
+    periods = []
+    started = last_up = previous_ts = run_id = None
+    run_ended = None
+    stale_after = max(60, interval * 3)
+
+    def append(ended, interrupted):
+        if started is not None and started < day_end and (ended if ended is not None else now) >= day_start:
+            periods.append({
+                "started_at": started, "ended_at": ended, "interrupted": interrupted,
+                "started": format_time(started),
+                "ended": format_time(ended) if ended is not None else None,
+                "duration_seconds": max(0, (ended if ended is not None else now) - started),
+            })
+
+    rows = connection.execute(
+        "SELECT s.run_id,s.ts,s.status,r.ended_at FROM samples s "
+        "JOIN runs r ON r.id=s.run_id WHERE r.started_at < ? "
+        "AND (r.ended_at IS NULL OR r.ended_at >= ?) ORDER BY s.id",
+        (day_end, day_start),
+    )
+    for ident, timestamp, status, ended_at in rows:
+        if ident != run_id or (previous_ts is not None and timestamp - previous_ts > stale_after):
+            append(last_up, True)
+            started = last_up = None
+        run_id, run_ended, previous_ts = ident, ended_at, timestamp
+        if status == "up":
+            if started is None:
+                started = timestamp
+            last_up = timestamp
+        elif status == "down" and started is not None:
+            append(timestamp, False)
+            started = last_up = None
+    if started is not None:
+        interrupted = run_ended is not None or now - previous_ts > stale_after
+        append(last_up if interrupted else None, interrupted)
+    return list(reversed(periods[-30:]))
+
+
+def dashboard_data(connection, host, selected_day, days, interval):
+    today = datetime.now().date()
+    first_day = (today - timedelta(days=days - 1)).isoformat()
+    latest = connection.execute(
+        "SELECT s.ts,s.status,s.mac,s.reason,r.ended_at "
+        "FROM samples s JOIN runs r ON r.id=s.run_id ORDER BY s.id DESC LIMIT 1"
+    ).fetchone()
+    current = None
+    if latest:
+        timestamp, status, mac, reason, ended_at = latest
+        current = {
+            "timestamp": timestamp,
+            "time": format_time(timestamp),
+            "status": status,
+            "mac": mac,
+            "reason": reason,
+            "monitor_running": ended_at is None and time.time() - timestamp <= max(60, interval * 3),
+        }
+    daily = [
+        {"day": day, "up": up, "down": down, "error": error,
+         "availability": round(100 * up / (up + down), 2) if up + down else None}
+        for day, up, down, error in connection.execute(
+            "SELECT day,up_samples,down_samples,error_samples FROM daily "
+            "WHERE day>=? ORDER BY day", (first_day,)
+        )
+    ]
+    minute_rows = [
+        {"minute": minute, "up": up, "down": down, "error": error}
+        for minute, up, down, error in connection.execute(
+            "SELECT minute_of_day,up_samples,down_samples,error_samples "
+            "FROM minutes WHERE day=? ORDER BY minute_of_day", (selected_day,)
+        )
+    ]
+    day_start = int(datetime.strptime(selected_day, "%Y-%m-%d").timestamp())
+    day_end = int((datetime.strptime(selected_day, "%Y-%m-%d") + timedelta(days=1)).timestamp())
+    outages = [
+        {"started_at": started, "ended_at": ended, "interrupted": bool(interrupted),
+         "started": format_time(started), "ended": format_time(ended) if ended else None,
+         "duration_seconds": max(0, (ended or int(time.time())) - started)}
+        for started, ended, interrupted in connection.execute(
+            "SELECT started_at,ended_at,interrupted FROM outages "
+            "WHERE started_at < ? AND (ended_at IS NULL OR ended_at >= ?) "
+            "ORDER BY started_at DESC LIMIT 30", (day_end, day_start),
+        )
+    ]
+    return {
+        "host": host,
+        "today": today.isoformat(),
+        "selected_day": selected_day,
+        "interval_seconds": interval,
+        "current": current,
+        "summary": {
+            "today": summary_counts(connection, today.isoformat()),
+            "week": summary_counts(connection, (today - timedelta(days=6)).isoformat()),
+            "month": summary_counts(connection, (today - timedelta(days=29)).isoformat()),
+            "all": summary_counts(connection, "0000-01-01"),
+        },
+        "days": daily,
+        "minutes": minute_rows,
+        "outages": outages,
+        "uptimes": availability_periods(connection, day_start, day_end, interval, int(time.time())),
+    }
+
+
+def run_monitor(args):
+    signal.signal(signal.SIGTERM, stop_handler)
+    signal.signal(signal.SIGINT, stop_handler)
+    connection = open_database(args.db, create=True)
+    run_id = start_run(connection)
+    endpoint = args.url if args.type == "http" else args.host
+    print(f"Мониторинг {endpoint} ({args.type}) запущен: каждые {args.interval} с; база {args.db}", flush=True)
+    next_check = time.monotonic()
+    last_prune_day = None
+    try:
+        while not stopping:
+            delay = next_check - time.monotonic()
+            if delay > 0:
+                time.sleep(min(delay, 1))
+                continue
+            timestamp = int(time.time())
+            status, mac, reason = probe(args)
+            changed = record_sample(connection, run_id, timestamp, status, mac, reason)
+            try:
+                connection = restore_missing_database(connection, args.db)
+            except (OSError, sqlite3.Error) as exc:
+                print(f"Не удалось восстановить исчезнувшую базу: {exc}", file=sys.stderr, flush=True)
+            if changed or status == "error":
+                print(f"{format_time(timestamp)} {status}: {reason}", flush=True)
+            day = datetime.fromtimestamp(timestamp).date().isoformat()
+            if last_prune_day != day:
+                prune_samples(connection, args.retention_days)
+                last_prune_day = day
+            next_check = max(next_check + args.interval, time.monotonic() + 0.01)
+    finally:
+        finish_run(connection, run_id)
+        connection.close()
+        print("Мониторинг остановлен", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("run", "check", "status", "history", "json"))
+    parser.add_argument("--host", default="192.168.1.113")
+    parser.add_argument("--url", default="")
+    parser.add_argument("--type", choices=("arp", "icmp", "http"), default="arp")
+    parser.add_argument("--interface", default="br-lan")
+    parser.add_argument("--mac", default="18:DE:50:E1:86:32")
+    parser.add_argument("--interval", type=int, default=15)
+    parser.add_argument("--timeout", type=int, default=5)
+    parser.add_argument("--expected-status", type=int, default=200)
+    parser.add_argument("--retention-days", type=int, default=90)
+    parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--day", default=None)
+    args = parser.parse_args()
+    if (not 5 <= args.interval <= 3600 or not 1 <= args.timeout <= 60 or
+            not 1 <= args.retention_days <= 3650 or not 1 <= args.days <= 366 or
+            not 100 <= args.expected_status <= 599):
+        parser.error("interval 5..3600, timeout 1..60, retention-days 1..3650, days 1..366, expected-status 100..599")
+    if args.type == "http" and not args.url.startswith(("http://", "https://")):
+        parser.error("для HTTP нужна URL с http:// или https://")
+    if args.day:
+        try:
+            if datetime.strptime(args.day, "%Y-%m-%d").date().isoformat() != args.day:
+                raise ValueError()
+        except ValueError:
+            parser.error("day должен быть в формате YYYY-MM-DD")
+    try:
+        if args.command == "check":
+            status, mac, reason = probe(args)
+            endpoint = args.url if args.type == "http" else args.host
+            print(f"{endpoint}: {status}; {reason}" + (f"; MAC {mac}" if mac else ""))
+            return 0 if status == "up" else 1 if status == "down" else 2
+        if args.command == "run":
+            run_monitor(args)
+        else:
+            connection = open_database(args.db)
+            try:
+                if args.command == "status":
+                    print_status(connection, args.host)
+                elif args.command == "json":
+                    data = dashboard_data(
+                        connection, args.host, args.day or datetime.now().date().isoformat(),
+                        args.days, args.interval,
+                    )
+                    print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                else:
+                    print_history(connection, max(1, min(args.limit, 100)))
+            finally:
+                connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
