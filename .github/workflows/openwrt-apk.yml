@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
     paths: ['files/**', 'package/**', 'tests/**', '.github/workflows/openwrt-apk.yml', 'keys/**']
+  pull_request:
+    paths: ['files/**', 'package/**', 'tests/**', '.github/workflows/openwrt-apk.yml']
   workflow_dispatch:
 permissions:
   contents: write
@@ -16,8 +18,14 @@ jobs:
           python3 -m compileall -q files/usr/libexec tests
           python3 tests/test_availability.py
           python3 tests/test_svitlo.py
+          python3 tests/test_package_ownership.py
       - name: Install host packages
         run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential gawk gettext libncurses-dev libssl-dev python3 rsync unzip zlib1g-dev file wget curl zstd flex bison
+      - name: Cache official OpenWrt SDK tarball
+        uses: actions/cache@v4
+        with:
+          path: /tmp/openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+          key: openwrt-sdk-25.12.6-x86-64-gcc-14.3.0-musl
       - name: Download official OpenWrt SDK
         shell: bash
         run: |
@@ -25,34 +33,44 @@ jobs:
           base=https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
           sdk_name=openwrt-sdk-25.12.6-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
           sdk_sha256=1864152619092e781fa36a401960c8e9ae42d6a364c44ee5f0b197ca5f3c0fcc
-          curl -fL --retry 3 -o "/tmp/$sdk_name" "$base/$sdk_name"
+          if [ ! -s "/tmp/$sdk_name" ]; then
+            curl -fL --retry 3 -o "/tmp/$sdk_name" "$base/$sdk_name"
+          fi
           printf "%s  %s\n" "$sdk_sha256" "/tmp/$sdk_name" | sha256sum -c -
           mkdir -p /tmp/owrt
           tar --zstd -xf "/tmp/$sdk_name" -C /tmp/owrt
           mv /tmp/owrt/openwrt-sdk-* sdk
-      - name: Build APK
+      - name: Build standalone and combined APKs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p sdk/package/luci-app-blackout-monitor
-          cp package/luci-app-blackout-monitor/Makefile sdk/package/luci-app-blackout-monitor/Makefile
-          cp -a files sdk/package/luci-app-blackout-monitor/files
-          sed -i "s/^PKG_RELEASE:=1$/PKG_RELEASE:=$GITHUB_RUN_NUMBER/" sdk/package/luci-app-blackout-monitor/Makefile
+          for pkg in luci-app-smartmeter-monitor luci-app-blackout-monitor; do
+            mkdir -p "sdk/package/$pkg"
+            cp "package/$pkg/Makefile" "sdk/package/$pkg/Makefile"
+            cp -a files "sdk/package/$pkg/files"
+            sed -i "s/^PKG_RELEASE:=1$/PKG_RELEASE:=$GITHUB_RUN_NUMBER/" "sdk/package/$pkg/Makefile"
+          done
           cd sdk
           ./scripts/feeds update -a
           ./scripts/feeds install -a -p packages
           ./scripts/feeds install -a -p luci
-          printf '\nCONFIG_PACKAGE_luci-app-blackout-monitor=y\n' >> .config
+          printf '\nCONFIG_PACKAGE_luci-app-smartmeter-monitor=y\nCONFIG_PACKAGE_luci-app-blackout-monitor=y\n' >> .config
           rm -rf tmp
           make defconfig
+          make -j"$(nproc)" package/luci-app-smartmeter-monitor/compile V=s
           make -j"$(nproc)" package/luci-app-blackout-monitor/compile V=s
-          test "$(find bin/packages -name 'luci-app-blackout-monitor-*.apk' | wc -l)" -eq 1
+          for pkg in luci-app-smartmeter-monitor luci-app-blackout-monitor; do
+            test "$(find bin/packages -name "$pkg-*.apk" | wc -l)" -eq 1
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: luci-app-blackout-monitor-apk
-          path: sdk/bin/packages/**/luci-app-blackout-monitor-*.apk
+          name: openwrt-blackout-and-smartmeter-apks
+          path: |
+            sdk/bin/packages/**/luci-app-blackout-monitor-*.apk
+            sdk/bin/packages/**/luci-app-smartmeter-monitor-*.apk
           if-no-files-found: error
       - name: Sign APK feed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: sign
         env:
           APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
@@ -66,7 +84,7 @@ jobs:
           cmp keys/blackout-monitor.pem "$RUNNER_TEMP/public.pem"
           mkdir -p public/keys public/releases/25.12/x86_64
           cp keys/blackout-monitor.pem public/keys/
-          find sdk/bin/packages -name 'luci-app-blackout-monitor-*.apk' -exec cp '{}' public/releases/25.12/x86_64/ \;
+          find sdk/bin/packages \( -name 'luci-app-blackout-monitor-*.apk' -o -name 'luci-app-smartmeter-monitor-*.apk' \) -exec cp '{}' public/releases/25.12/x86_64/ \;
           (cd public/releases/25.12/x86_64 && "$GITHUB_WORKSPACE/sdk/staging_dir/host/bin/apk" mkndx --allow-untrusted --sign-key "$RUNNER_TEMP/key.pem" --output packages.adb *.apk)
           printf '<!doctype html><title>BlackoutMonitor APK</title><h1>BlackoutMonitor signed APK feed</h1>' > public/index.html
           touch public/.nojekyll
