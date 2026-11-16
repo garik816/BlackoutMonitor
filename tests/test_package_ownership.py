@@ -19,7 +19,7 @@ def main():
     smart = owned_files("luci-app-smartmeter-monitor")
     blackout = owned_files("luci-app-blackout-monitor")
     actual = {str(path.relative_to(FILES)).replace("\\", "/")
-              for path in FILES.rglob("*") if path.is_file()}
+              for path in FILES.rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
     assert not (smart & blackout), f"Overlapping package payloads: {smart & blackout}"
     assert actual == (smart | blackout), (
         f"Unowned files: {actual - (smart | blackout)}; missing sources: {(smart | blackout) - actual}"
