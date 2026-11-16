@@ -1,6 +1,6 @@
 include $(TOPDIR)/rules.mk
 PKG_NAME:=luci-app-blackout-monitor
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Unspecified
 PKG_MAINTAINER:=garik816
@@ -12,13 +12,13 @@ define Package/luci-app-blackout-monitor
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
-  TITLE:=BlackoutMonitor and SmartMeterMonitor
+  TITLE:=Blackout schedule and analytics
   URL:=https://github.com/garik816/BlackoutMonitor
-  DEPENDS:=+luci-base +rpcd-mod-file +python3-light +python3-sqlite3 +python3-xml +python3-urllib +curl +nmap
+  DEPENDS:=+luci-app-smartmeter-monitor
 endef
 
 define Package/luci-app-blackout-monitor/description
-  LuCI pages for availability monitoring, outage schedules and SQLite analytics.
+  Electricity outage schedules and analytics based on SmartMeter availability data.
 endef
 
 define Build/Prepare
@@ -29,33 +29,36 @@ define Build/Compile
 endef
 
 define Package/luci-app-blackout-monitor/install
-	$(INSTALL_DIR) $(1)
-	$(CP) $(CURDIR)/files/. $(1)/
-	chmod 0755 $(1)/etc/init.d/smartmeter-availability \
-		$(1)/etc/init.d/svitlo-schedule \
-		$(1)/usr/bin/smartmeter-availability \
-		$(1)/usr/libexec/smartmeter-availability-config \
-		$(1)/usr/libexec/smartmeter-availability-dashboard \
-		$(1)/usr/libexec/svitlo-schedule \
-		$(1)/usr/libexec/svitlo-schedule-watch
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DIR) $(1)/usr/share/ucode/luci/template/my-scripts
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/my-scripts
+	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/svitlo-schedule $(1)/etc/init.d/svitlo-schedule
+	$(INSTALL_BIN) $(CURDIR)/files/usr/libexec/svitlo-schedule $(1)/usr/libexec/svitlo-schedule
+	$(INSTALL_BIN) $(CURDIR)/files/usr/libexec/svitlo-schedule-watch $(1)/usr/libexec/svitlo-schedule-watch
+	$(INSTALL_DATA) $(CURDIR)/files/usr/libexec/svitlo_analysis.py $(1)/usr/libexec/svitlo_analysis.py
+	$(INSTALL_DATA) $(CURDIR)/files/usr/libexec/svitlo_schedule.py $(1)/usr/libexec/svitlo_schedule.py
+	$(INSTALL_DATA) $(CURDIR)/files/usr/share/luci/menu.d/luci-app-svitlo.json $(1)/usr/share/luci/menu.d/luci-app-svitlo.json
+	$(INSTALL_DATA) $(CURDIR)/files/usr/share/rpcd/acl.d/luci-app-svitlo.json $(1)/usr/share/rpcd/acl.d/luci-app-svitlo.json
+	$(INSTALL_DATA) $(CURDIR)/files/usr/share/ucode/luci/template/my-scripts/svitlo.ut $(1)/usr/share/ucode/luci/template/my-scripts/svitlo.ut
+	$(INSTALL_DATA) $(CURDIR)/files/www/luci-static/resources/view/my-scripts/svitlo.js $(1)/www/luci-static/resources/view/my-scripts/svitlo.js
 endef
 
-# Existing UCI configuration and /root/*.sqlite3 are never package-owned.
+# Do not re-enable a service intentionally disabled by an operator on upgrades.
+# /etc/blackout-monitor is deliberately not package-owned and survives upgrades.
 define Package/luci-app-blackout-monitor/postinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
-if [ ! -e /etc/config/smartmeter-availability ]; then
-	cp /etc/config/smartmeter-availability.example /etc/config/smartmeter-availability
-	uci -q set smartmeter-availability.main.enabled='0'
-	uci -q commit smartmeter-availability
-	/etc/init.d/smartmeter-availability enable 2>/dev/null || true
-	/etc/init.d/svitlo-schedule enable 2>/dev/null || true
+if [ ! -e /etc/blackout-monitor/schedule-initialized ]; then
+  mkdir -p /etc/blackout-monitor
+  /etc/init.d/svitlo-schedule enable 2>/dev/null || true
+  touch /etc/blackout-monitor/schedule-initialized
 fi
 /etc/init.d/rpcd reload 2>/dev/null || true
-/etc/init.d/smartmeter-availability enabled >/dev/null 2>&1 && \
-	/etc/init.d/smartmeter-availability restart 2>/dev/null || true
 /etc/init.d/svitlo-schedule enabled >/dev/null 2>&1 && \
-	/etc/init.d/svitlo-schedule restart 2>/dev/null || true
+  /etc/init.d/svitlo-schedule restart 2>/dev/null || true
 rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*.json
 exit 0
 endef
@@ -63,7 +66,6 @@ endef
 define Package/luci-app-blackout-monitor/prerm
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
-/etc/init.d/smartmeter-availability stop 2>/dev/null || true
 /etc/init.d/svitlo-schedule stop 2>/dev/null || true
 exit 0
 endef
